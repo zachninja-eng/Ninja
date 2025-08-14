@@ -1,0 +1,257 @@
+#Requires -Version 5.1
+<#
+PowerShell
+Remote Access Tool (RAT/remote support) discovery
+- Scans: Installed Programs (Uninstall), Services, Processes, Scheduled Tasks, Registry keys, Common paths
+- Outputs: CSV to a path you set below + console summary
+#>
+
+# === EDIT THIS FOLDER PATH ONLY ===
+$csvDownloadLocation = 'C:\Users\Public\Desktop'
+# ==================================
+
+$timestamp = (Get-Date).ToString('yyyy-MM-dd_HH-mm-ss')
+$csvFile   = "RemoteAccessTools_{0}_{1}.csv" -f $env:COMPUTERNAME, $timestamp
+$csvPath   = Join-Path $csvDownloadLocation $csvFile
+
+# Known remote access tools & signatures (regex; case-insensitive)
+$Indicators = @(
+    @{ Product='TeamViewer';                  DisplayName='(?i)TeamViewer';                   Process='(?i)TeamViewer.*\.exe';            Service='(?i)^TeamViewer';                     RegKeys=@('HKLM:\SOFTWARE\TeamViewer');                      Paths=@('C:\Program Files\TeamViewer','C:\Program Files (x86)\TeamViewer') }
+    @{ Product='AnyDesk';                     DisplayName='(?i)AnyDesk';                      Process='(?i)AnyDesk\.exe';                  Service='(?i)AnyDesk';                          RegKeys=@('HKLM:\SOFTWARE\AnyDesk');                         Paths=@('C:\Program Files\AnyDesk','C:\Program Files (x86)\AnyDesk') }
+    @{ Product='ConnectWise Control / ScreenConnect'; DisplayName='(?i)(ScreenConnect|ConnectWise Control)'; Process='(?i)(ScreenConnect|ConnectWise).*\.exe'; Service='(?i)ScreenConnect Client'; RegKeys=@('HKLM:\SOFTWARE\ScreenConnect');      Paths=@('C:\ProgramData\ScreenConnect Client','C:\Program Files\ScreenConnect Client') }
+    @{ Product='Splashtop Streamer';         DisplayName='(?i)Splashtop.*(Streamer|Remote)';  Process='(?i)(SRService|Streamer|Splashtop).*\.exe'; Service='(?i)Splashtop(RemoteService|R.*)'; RegKeys=@(); Paths=@('C:\Program Files (x86)\Splashtop','C:\Program Files\Splashtop') }
+    @{ Product='RealVNC Server';              DisplayName='(?i)VNC Server|RealVNC';           Process='(?i)vncserver\.exe';                Service='(?i)^VNC Server$|^vncserver$';         RegKeys=@('HKLM:\SOFTWARE\RealVNC');                         Paths=@('C:\Program Files\RealVNC') }
+    @{ Product='RealVNC Viewer';              DisplayName='(?i)VNC Viewer';                    Process='(?i)vncviewer\.exe';                Service='';                                     RegKeys=@('HKLM:\SOFTWARE\RealVNC');                         Paths=@('C:\Program Files\RealVNC\VNC Viewer') }
+    @{ Product='TightVNC';                    DisplayName='(?i)TightVNC';                      Process='(?i)tvnserver\.exe|tvnviewer\.exe'; Service='(?i)TightVNC|^tvnserver$';             RegKeys=@('HKLM:\SOFTWARE\TightVNC');                         Paths=@('C:\Program Files\TightVNC','C:\Program Files (x86)\TightVNC') }
+    @{ Product='UltraVNC';                    DisplayName='(?i)UltraVNC';                      Process='(?i)winvnc\.exe';                   Service='(?i)uvnc|uvnc_service|uvnc_server';    RegKeys=@('HKLM:\SOFTWARE\UltraVNC');                         Paths=@('C:\Program Files\UltraVNC','C:\Program Files (x86)\UltraVNC') }
+    @{ Product='Chrome Remote Desktop';       DisplayName='(?i)Chrome Remote Desktop';         Process='(?i)remoting_host\.exe';            Service='(?i)chromoting|Chrome Remote Desktop'; RegKeys=@();                                            Paths=@('C:\Program Files\Google\Chrome Remote Desktop') }
+    @{ Product='LogMeIn / GoTo (Rescue/Resolve)'; DisplayName='(?i)(LogMeIn|GoTo(Assist| Resolve| Rescue))'; Process='(?i)(LMI|LogMeIn|GoTo|Rescue).*\.exe'; Service='(?i)(LogMeIn|LMIGuardianSvc|GoTo)';   RegKeys=@('HKLM:\SOFTWARE\LogMeIn','HKLM:\SOFTWARE\GoTo');      Paths=@('C:\Program Files (x86)\LogMeIn','C:\Program Files\LogMeIn') }
+    @{ Product='Zoho Assist';                 DisplayName='(?i)Zoho Assist';                   Process='(?i)ZohoAssist.*\.exe';             Service='(?i)Zoho.*Assist';                      RegKeys=@('HKLM:\SOFTWARE\Zoho');                               Paths=@('C:\Program Files\ZohoAssist','C:\ProgramData\ZohoAssist') }
+    @{ Product='BeyondTrust / Bomgar';        DisplayName='(?i)(BeyondTrust|Bomgar)';          Process='(?i)(bomgar|beyondtrust).*\.exe';   Service='(?i)(Bomgar|BeyondTrust).*';            RegKeys=@('HKLM:\SOFTWARE\Bomgar','HKLM:\SOFTWARE\BeyondTrust'); Paths=@('C:\Program Files\BeyondTrust','C:\ProgramData\Bomgar') }
+    @{ Product='Dameware Mini Remote Control';DisplayName='(?i)Dameware';                      Process='(?i)DWRCS\.exe|Dameware.*\.exe';    Service='(?i)^(DWMRCS|DWRCS)$|Dameware';         RegKeys=@('HKLM:\SOFTWARE\DameWare');                           Paths=@('C:\Program Files\SolarWinds\DameWare','C:\Program Files (x86)\SolarWinds\DameWare') }
+    @{ Product='Remote Utilities Host';       DisplayName='(?i)Remote Utilities|RU Host';      Process='(?i)rutserv\.exe';                  Service='(?i)(RUtService|rutserv|RManService)';  RegKeys=@('HKLM:\SOFTWARE\Usoris');                             Paths=@('C:\Program Files (x86)\Remote Utilities - Host') }
+    @{ Product='RustDesk';                    DisplayName='(?i)RustDesk';                      Process='(?i)rustdesk\.exe';                 Service='(?i)^rustdesk';                         RegKeys=@();                                                  Paths=@('C:\Program Files\RustDesk','C:\Program Files (x86)\RustDesk') }
+    @{ Product='DWService / DWAgent';         DisplayName='(?i)DW(Service|Agent)';             Process='(?i)dwagent\.exe|dwservice.*\.exe'; Service='(?i)^dwagent';                          RegKeys=@('HKLM:\SOFTWARE\DWAgent');                            Paths=@('C:\Program Files\DWAgent') }
+    @{ Product='RemotePC';                    DisplayName='(?i)RemotePC';                      Process='(?i)RemotePC.*\.exe';               Service='(?i)^RemotePC';                         RegKeys=@('HKLM:\SOFTWARE\RemotePC');                           Paths=@('C:\Program Files\RemotePC') }
+    @{ Product='Parsec';                      DisplayName='(?i)Parsec';                        Process='(?i)parsec.*\.exe';                 Service='(?i)^Parsec';                           RegKeys=@('HKLM:\SOFTWARE\Parsec');                              Paths=@('C:\Program Files\Parsec') }
+)
+
+# ----------------------------- Helpers ------------------------------------
+function Get-UninstallEntries {
+    $roots = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+    foreach ($rk in $roots) {
+        if (Test-Path $rk) {
+            Get-ChildItem $rk -ErrorAction SilentlyContinue | ForEach-Object {
+                $p = Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue
+                if ($p.DisplayName) {
+                    [PSCustomObject]@{
+                        DisplayName     = [string]$p.DisplayName
+                        DisplayVersion  = [string]$p.DisplayVersion
+                        Publisher       = [string]$p.Publisher
+                        InstallLocation = [string]$p.InstallLocation
+                        UninstallString = [string]$p.UninstallString
+                        RegistryPath    = $_.PsPath
+                    }
+                }
+            }
+        }
+    }
+}
+
+function Get-ProcInfo {
+    try {
+        Get-CimInstance Win32_Process | Select-Object ProcessId, Name, ExecutablePath, CommandLine
+    } catch {
+        # Fallback without ExecutablePath if CIM blocked
+        Get-Process | Select-Object Id -ExpandProperty Name | ForEach-Object {
+            [PSCustomObject]@{ ProcessId = $null; Name = $_; ExecutablePath = $null; CommandLine = $null }
+        }
+    }
+}
+
+function Get-ServiceInfo {
+    try {
+        Get-CimInstance Win32_Service | Select-Object Name, DisplayName, State, StartMode, PathName
+    } catch {
+        Get-Service | Select-Object Name, DisplayName, Status, StartType | ForEach-Object {
+            [PSCustomObject]@{ Name=$_.Name; DisplayName=$_.DisplayName; State=$_.Status; StartMode=$_.StartType; PathName=$null }
+        }
+    }
+}
+
+function Get-TaskExecPaths {
+    $rows = @()
+    try {
+        Get-ScheduledTask | ForEach-Object {
+            $task = $_
+            try {
+                $def = (Get-ScheduledTaskInfo -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop) | Out-Null
+                $actions = $task.Actions
+                foreach ($a in $actions) {
+                    if ($a.Execute) {
+                        $rows += [PSCustomObject]@{
+                            TaskName = ($task.TaskPath + $task.TaskName)
+                            Execute  = $a.Execute
+                            Arguments= $a.Arguments
+                        }
+                    }
+                }
+            } catch {}
+        }
+    } catch {}
+    $rows
+}
+
+function Add-Finding {
+    param(
+        [ref]$List, [string]$Product, [string]$MatchType, [string]$Evidence,
+        [string]$Version='', [string]$Publisher='', [string]$Path='', [string]$Extra='',
+        [string]$Confidence='Medium'
+    )
+    $List.Value.Add([PSCustomObject]@{
+        TimeFound  = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        Computer   = $env:COMPUTERNAME
+        Product    = $Product
+        MatchType  = $MatchType
+        Evidence   = $Evidence
+        Version    = $Version
+        Publisher  = $Publisher
+        Path       = $Path
+        Extra      = $Extra
+        Confidence = $Confidence
+    }) | Out-Null
+}
+
+# --------------------------- Data Collection ------------------------------
+try { if (-not (Test-Path $csvDownloadLocation)) { New-Item -ItemType Directory -Path $csvDownloadLocation -Force | Out-Null } } catch {}
+
+$findings = New-Object System.Collections.Generic.List[object]
+$seenKey  = New-Object System.Collections.Generic.HashSet[string]  # for dedupe
+
+$inst   = Get-UninstallEntries
+$procs  = Get-ProcInfo
+$svcs   = Get-ServiceInfo
+$tasks  = Get-TaskExecPaths
+
+# Quick file system probes (non-recursive except 2 levels to avoid noise)
+function Probe-Paths {
+    param($paths, $nameRegex)
+    $hits = @()
+    foreach ($p in $paths) {
+        if (Test-Path $p) {
+            try {
+                $hits += Get-ChildItem -Path $p -Recurse -Depth 2 -File -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -match $nameRegex -or $_.FullName -match $nameRegex }
+            } catch {}
+        }
+    }
+    $hits
+}
+
+# ----------------------------- Matching -----------------------------------
+foreach ($ind in $Indicators) {
+    $prod = $ind.Product
+    $dnRx = $ind.DisplayName
+    $prRx = $ind.Process
+    $svRx = $ind.Service
+    $rkLs = $ind.RegKeys
+    $paLs = $ind.Paths
+
+    # Installed Programs
+    if ($inst) {
+        $inst | Where-Object { $_.DisplayName -match $dnRx -or ($_.Publisher -and $_.Publisher -match $dnRx) } | ForEach-Object {
+            $key = "$prod|install|$($_.RegistryPath)"
+            if ($seenKey.Add($key)) {
+                Add-Finding ([ref]$findings) $prod 'InstalledProgram' $_.DisplayName `
+                    $_.DisplayVersion $_.Publisher $_.InstallLocation $_.RegistryPath 'High'
+            }
+        }
+    }
+
+    # Services
+    if ($svcs -and $svRx) {
+        $svcs | Where-Object {
+            ($_.Name -match $svRx) -or ($_.DisplayName -match $svRx) -or ($_.PathName -and ($_.PathName -match $svRx -or $_.PathName -match $prRx))
+        } | ForEach-Object {
+            $ev = "$($_.Name) / $($_.DisplayName)"
+            $key = "$prod|service|$($_.Name)"
+            if ($seenKey.Add($key)) {
+                Add-Finding ([ref]$findings) $prod 'Service' $ev '' '' $_.PathName ("State=$($_.State); Start=$($_.StartMode)") 'High'
+            }
+        }
+    }
+
+    # Processes
+    if ($procs -and $prRx) {
+        $procs | Where-Object {
+            ($_.Name -match $prRx) -or ($_.ExecutablePath -and $_.ExecutablePath -match $prRx)
+        } | ForEach-Object {
+            $ev = "$($_.Name) (PID $($_.ProcessId))"
+            $key = "$prod|proc|$($_.Name)|$($_.ProcessId)"
+            if ($seenKey.Add($key)) {
+                Add-Finding ([ref]$findings) $prod 'Process' $ev '' '' $_.ExecutablePath $_.CommandLine 'Medium'
+            }
+        }
+    }
+
+    # Scheduled Tasks
+    if ($tasks) {
+        $tasks | Where-Object {
+            ($_.Execute -match $prRx) -or ($_.Execute -match $dnRx) -or ($_.Arguments -and $_.Arguments -match $prod)
+        } | ForEach-Object {
+            $key = "$prod|task|$($_.TaskName)"
+            if ($seenKey.Add($key)) {
+                Add-Finding ([ref]$findings) $prod 'ScheduledTask' $_.TaskName '' '' $_.Execute $_.Arguments 'Medium'
+            }
+        }
+    }
+
+    # Registry keys
+    foreach ($rk in $rkLs) {
+        try {
+            if (Test-Path $rk) {
+                $key = "$prod|reg|$rk"
+                if ($seenKey.Add($key)) {
+                    Add-Finding ([ref]$findings) $prod 'RegistryKey' $rk '' '' '' '' 'High'
+                }
+            }
+        } catch {}
+    }
+
+    # Common Paths
+    if ($paLs -and $prRx) {
+        $files = Probe-Paths -paths $paLs -nameRegex $prRx
+        foreach ($f in $files) {
+            $key = "$prod|file|$($f.FullName)"
+            if ($seenKey.Add($key)) {
+                Add-Finding ([ref]$findings) $prod 'File' $f.Name '' '' $f.FullName '' 'High'
+            }
+        }
+    }
+}
+
+# ----------------------------- Output -------------------------------------
+try {
+    if ($findings.Count -gt 0) {
+        $findings | Sort-Object Product, MatchType, Evidence | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+    } else {
+        "TimeFound,Computer,Product,MatchType,Evidence,Version,Publisher,Path,Extra,Confidence" | Out-File -FilePath $csvPath -Encoding UTF8
+    }
+    Write-Host "[Info] Remote access tools found: $($findings.Count). CSV: $csvPath"
+    if ($findings.Count -gt 0) {
+        $findings |
+          Group-Object Product | Sort-Object Count -Descending |
+          ForEach-Object { Write-Host (" - {0} ({1} hit{2})" -f $_.Name, $_.Count, $(if ($_.Count -ne 1) {'s'} else {''})) }
+    } else {
+        Write-Host " - None detected by current signatures."
+    }
+} catch {
+    Write-Host "[Error] Failed to write CSV: $($_.Exception.Message)"
+}
+
+# exit 0 for script result trigger
+exit 0
