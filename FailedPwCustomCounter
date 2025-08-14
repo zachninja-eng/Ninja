@@ -1,0 +1,42 @@
+#config
+$threshold = 5
+$minutesBack = 120
+$timeCutoff = (Get-Date).AddMinutes(-$minutesBack)
+$timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+
+#optional output
+#$userProfile = [Environment]::GetFolderPath("Desktop")
+#$logFolder = Join-Path $userProfile "FailedLoginAlerts"
+#$logFile = Join-Path $logFolder "alert_$timestamp.txt"
+# Create the folder if it doesn't exist
+#if (-not (Test-Path $logFolder)) {
+#    New-Item -Path $logFolder -ItemType Directory | Out-Null
+#}
+
+# grab logs
+$events = Get-WinEvent -FilterHashtable @{
+    LogName = 'Security';
+    Id = 4625;
+    StartTime = $timeCutoff
+} -ErrorAction SilentlyContinue
+# group by user
+$userFailures = $events | ForEach-Object {
+    $_.Properties[5].Value
+} | Where-Object { $_ -and $_ -ne "" } | Group-Object | Where-Object { $_.Count -ge $threshold }
+# format
+if ($userFailures.Count -gt 0) {
+    $summary = @()
+    $summary += "ALERT: The following users had $threshold or more failed logon attempts in the last $minutesBack minutes:`n"
+    foreach ($user in $userFailures) {
+        $summary += "• $($user.Name): $($user.Count) failed attempts"
+    }
+    #output
+    Ninja-Property-Set failedPasswordUser ($summary -join "`n")
+    Write-Output ($summary -join "`n")
+    exit 0
+} else {
+    $msg = "No users had $threshold+ failed logon attempts in the past $minutesBack minutes."
+    Ninja-Property-Set failedPasswordUser $msg
+    Write-Output $msg
+    exit 0
+}
