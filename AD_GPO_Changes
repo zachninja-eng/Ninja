@@ -1,0 +1,182 @@
+<#
+Monitors AD / GPO changes in the last N hours and writes a CSV.
+- Query source: Security log on a Domain Controller
+- Covers: Directory object changes (5136–5141), user & group changes (4720/22/25/26/38, 4728/29/31/32/33/34/35/37/54/56/57/64, 4767), and policy-ish (4739, 4719)
+- GPO changes show up as Directory Service Changes on 'groupPolicyContainer' or DN under CN=Policies,CN=System
+#>
+
+# === EDIT THESE ===
+$LookbackHours        = 12
+$csvDownloadLocation  = 'C:\Users\Public\Desktop'   # <- change path if desired
+# =======================
+
+# Build the output path
+$timestamp  = (Get-Date).ToString('yyyy-MM-dd_HH-mm-ss')
+$csvFile    = "AD_GPO_Changes_{0}_{1}.csv" -f $env:COMPUTERNAME, $timestamp
+$csvPath    = Join-Path $csvDownloadLocation $csvFile
+
+# Event IDs of interest
+$DirectoryChangeIds = 5136,5137,5138,5139,5141
+$UserChangeIds      = 4720,4722,4725,4726,4738,4767,4723,4724
+$GroupChangeIds     = 4727,4731,4754,4734,4735,4737,4764
+$GroupMemberIds     = 4728,4729,4732,4733,4756,4757
+$PolicyIds          = 4739,4719
+$AllIds             = $DirectoryChangeIds + $UserChangeIds + $GroupChangeIds + $GroupMemberIds + $PolicyIds
+
+# Helper: safe XML field getter
+function Get-XmlData {
+    param([xml]$Xml,[string]$Name)
+    ($Xml.Event.EventData.Data | Where-Object { $_.Name -eq $Name } | Select-Object -ExpandProperty '#text' -ErrorAction SilentlyContinue)
+}
+
+# Ensure folder exists
+try {
+    if (-not (Test-Path $csvDownloadLocation)) {
+        New-Item -ItemType Directory -Path $csvDownloadLocation -Force | Out-Null
+    }
+} catch {
+    Write-Host "[Error] Could not ensure CSV folder: $($_.Exception.Message)"
+    exit 0
+}
+
+$start = (Get-Date).AddHours(-[math]::Abs($LookbackHours))
+$rows  = New-Object System.Collections.Generic.List[object]
+
+# Grab events
+try {
+    $events = Get-WinEvent -FilterHashtable @{ LogName='Security'; Id=$AllIds; StartTime=$start } -ErrorAction Stop
+} catch {
+    Write-Host "[Info] No matching events or access error: $($_.Exception.Message)"
+    # Emit header-only CSV and exit 0
+    "TimeCreated,EventID,Category,Actor,ObjectType,ObjectName,Action,Details,Computer" | Out-File -FilePath $csvPath -Encoding UTF8
+    Write-Host "[Info] CSV saved to $csvPath"
+    exit 0
+}
+
+foreach ($e in $events) {
+    try {
+        $xml = [xml]$e.ToXml()
+
+        $actorUser = Get-XmlData $xml 'SubjectUserName'
+        $actorDom  = Get-XmlData $xml 'SubjectDomainName'
+        $actor     = if ($actorDom) { "$actorDom\$actorUser" } else { $actorUser }
+        $machine   = $e.MachineName
+        $time      = $e.TimeCreated
+        $id        = $e.Id
+
+        $objType   = $null
+        $objName   = $null
+        $action    = $null
+        $details   = $null
+        $category  = "AD"
+
+        switch ($id) {
+            # ----- Directory Service Changes -----
+            5136 {
+                $objName = Get-XmlData $xml 'ObjectDN'
+                $objType = Get-XmlData $xml 'ObjectClass'
+                $op      = Get-XmlData $xml 'OperationType' # Added/Removed/Modified (varies)
+                $attr    = Get-XmlData $xml 'AttributeLDAPDisplayName'
+                $oldV    = (Get-XmlData $xml 'OldValue')
+                $newV    = (Get-XmlData $xml 'NewValue')
+                $action  = "Object modified"
+                # GPO detection (AD-side container)
+                if ($objType -eq 'groupPolicyContainer' -or ($objName -like '*CN=Policies,CN=System,*')) { $category = "GPO" }
+                if ($attr) { $details = "$op $attr : '$oldV' -> '$newV'".Trim() } else { $details = $op }
+            }
+            5137 {
+                $objName = Get-XmlData $xml 'ObjectDN'
+                $objType = Get-XmlData $xml 'ObjectClass'
+                $action  = "Object created"
+                if ($objType -eq 'groupPolicyContainer' -or ($objName -like '*CN=Policies,CN=System,*')) { $category = "GPO" }
+            }
+            5138 {
+                $objName = Get-XmlData $xml 'ObjectDN'
+                $objType = Get-XmlData $xml 'ObjectClass'
+                $action  = "Object undeleted"
+                if ($objType -eq 'groupPolicyContainer' -or ($objName -like '*CN=Policies,CN=System,*')) { $category = "GPO" }
+            }
+            5139 {
+                $objName = Get-XmlData $xml 'ObjectDN'
+                $objType = Get-XmlData $xml 'ObjectClass'
+                $oldDN   = Get-XmlData $xml 'OldObjectDN'
+                $newDN   = Get-XmlData $xml 'NewObjectDN'
+                $action  = "Object moved"
+                $details = "From '$oldDN' To '$newDN'"
+                if ($objType -eq 'groupPolicyContainer' -or ($oldDN -like '*CN=Policies,CN=System,*') -or ($newDN -like '*CN=Policies,CN=System,*')) { $category = "GPO" }
+            }
+            5141 {
+                $objName = Get-XmlData $xml 'ObjectDN'
+                $objType = Get-XmlData $xml 'ObjectClass'
+                $action  = "Object deleted"
+                if ($objType -eq 'groupPolicyContainer' -or ($objName -like '*CN=Policies,CN=System,*')) { $category = "GPO" }
+            }
+
+            # ----- Group membership adds/removes -----
+            4728 { $group = Get-XmlData $xml 'TargetUserName'; $member = Get-XmlData $xml 'MemberName'; $objType='Group'; $objName=$group; $action='Member added to GLOBAL group'; $details="Member: $member" }
+            4729 { $group = Get-XmlData $xml 'TargetUserName'; $member = Get-XmlData $xml 'MemberName'; $objType='Group'; $objName=$group; $action='Member removed from GLOBAL group'; $details="Member: $member" }
+            4732 { $group = Get-XmlData $xml 'TargetUserName'; $member = Get-XmlData $xml 'MemberName'; $objType='Group'; $objName=$group; $action='Member added to LOCAL group';  $details="Member: $member" }
+            4733 { $group = Get-XmlData $xml 'TargetUserName'; $member = Get-XmlData $xml 'MemberName'; $objType='Group'; $objName=$group; $action='Member removed from LOCAL group'; $details="Member: $member" }
+            4756 { $group = Get-XmlData $xml 'TargetUserName'; $member = Get-XmlData $xml 'MemberName'; $objType='Group'; $objName=$group; $action='Member added to UNIVERSAL group'; $details="Member: $member" }
+            4757 { $group = Get-XmlData $xml 'TargetUserName'; $member = Get-XmlData $xml 'MemberName'; $objType='Group'; $objName=$group; $action='Member removed from UNIVERSAL group'; $details="Member: $member" }
+
+            # ----- Group create/delete/change -----
+            4727 { $objType='Global Group';  $objName = Get-XmlData $xml 'TargetUserName'; $action='Group created' }
+            4731 { $objType='Local Group';   $objName = Get-XmlData $xml 'TargetUserName'; $action='Group created' }
+            4754 { $objType='Universal Group';$objName = Get-XmlData $xml 'TargetUserName'; $action='Group created' }
+            4734 { $objType='Local Group';   $objName = Get-XmlData $xml 'TargetUserName'; $action='Group deleted' }
+            4735 { $objType='Group';         $objName = Get-XmlData $xml 'TargetUserName'; $action='Group membership/attrs changed' }
+            4737 { $objType='Global Group';  $objName = Get-XmlData $xml 'TargetUserName'; $action='Group membership/attrs changed' }
+            4764 { $objType='Group';         $objName = Get-XmlData $xml 'TargetUserName'; $action='Group type changed' }
+
+            # ----- User lifecycle & changes -----
+            4720 { $objType='User'; $objName = Get-XmlData $xml 'TargetUserName'; $action='User created' }
+            4726 { $objType='User'; $objName = Get-XmlData $xml 'TargetUserName'; $action='User deleted' }
+            4722 { $objType='User'; $objName = Get-XmlData $xml 'TargetUserName'; $action='User enabled' }
+            4725 { $objType='User'; $objName = Get-XmlData $xml 'TargetUserName'; $action='User disabled' }
+            4738 { $objType='User'; $objName = Get-XmlData $xml 'TargetUserName'; $action='User account changed' }
+            4767 { $objType='User'; $objName = Get-XmlData $xml 'TargetUserName'; $action='User unlocked' }
+            4723 { $objType='User'; $objName = Get-XmlData $xml 'TargetUserName'; $action='User changed own password (attempt)' }
+            4724 { $objType='User'; $objName = Get-XmlData $xml 'TargetUserName'; $action='An account password was reset' }
+
+            # ----- Policy-ish -----
+            4739 { $objType='Domain'; $objName=(Get-XmlData $xml 'DomainName'); $action='Domain policy changed'; $category='Policy' }
+            4719 { $objType='System'; $objName=$env:COMPUTERNAME; $action='System audit policy changed'; $category='Policy' }
+
+            Default {
+                $objName = Get-XmlData $xml 'ObjectDN'
+                if (-not $objName) { $objName = Get-XmlData $xml 'TargetUserName' }
+                $objType = Get-XmlData $xml 'ObjectClass'
+                $action  = "Event $id"
+            }
+        }
+
+        $rows.Add([PSCustomObject]@{
+            TimeCreated = $time.ToString('yyyy-MM-dd HH:mm:ss')
+            EventID     = $id
+            Category    = $category
+            Actor       = $actor
+            ObjectType  = $objType
+            ObjectName  = $objName
+            Action      = $action
+            Details     = $details
+            Computer    = $machine
+        })
+    } catch {
+        # single bad event to keep the run going
+    }
+}
+
+# Export CSV (header-only if no rows)
+try {
+    if ($rows.Count -gt 0) {
+        $rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+    } else {
+        "TimeCreated,EventID,Category,Actor,ObjectType,ObjectName,Action,Details,Computer" | Out-File -FilePath $csvPath -Encoding UTF8
+    }
+    Write-Host "[Info] CSV saved to $csvPath (Events: $($rows.Count))"
+} catch {
+    Write-Host "[Error] Failed to write CSV: $($_.Exception.Message)"
+}
+
+exit 0
