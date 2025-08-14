@@ -1,0 +1,80 @@
+<#
+Detect self-promotion to administrators:
+- Local "Administrators" (4732)
+- "Domain Admins" (4728)
+- "Enterprise Admins" (4756)
+#>
+
+param(
+    [double]$LookbackMinutes = 5
+)
+
+# --- helpers ---------------------------------------------------------------
+function Get-XmlData {
+    param([xml]$Xml, [string]$Name)
+    ($Xml.Event.EventData.Data | Where-Object { $_.Name -eq $Name } | Select-Object -ExpandProperty '#text' -ErrorAction SilentlyContinue)
+}
+function Resolve-Id {
+    param([string]$NameOrSid)
+    if ([string]::IsNullOrWhiteSpace($NameOrSid)) { return $null }
+    if ($NameOrSid -match '^S-\d-\d+-.+') {
+        try { return ([System.Security.Principal.SecurityIdentifier]$NameOrSid).Translate([System.Security.Principal.NTAccount]).Value }
+        catch { return $NameOrSid }
+    }
+    return $NameOrSid
+}
+
+$startTime   = (Get-Date).AddMinutes(-[math]::Abs($LookbackMinutes))
+$adminGroups = @('Administrators','Domain Admins','Enterprise Admins')
+$ids         = @(4732,4728,4756)   # local/global/universal group add events
+
+# --- query ----------------------------------------------------------------
+$events = Get-WinEvent -FilterHashtable @{ LogName='Security'; StartTime=$startTime; Id=$ids } -ErrorAction SilentlyContinue
+
+if (-not $events) {
+    Write-Host "[Info] No admin self-promotion events in the last $LookbackMinutes minute(s)."
+    exit 0
+}
+
+$hits = 0
+foreach ($e in $events) {
+    $xml = [xml]$e.ToXml()
+
+    $targetGroup = Get-XmlData $xml 'TargetUserName'   # the group name
+    if (-not $targetGroup) { continue }
+    if (-not ($adminGroups -contains $targetGroup)) { continue }
+
+    $subjectUser = Get-XmlData $xml 'SubjectUserName'
+    $subjectDom  = Get-XmlData $xml 'SubjectDomainName'
+    $subjectSid  = Get-XmlData $xml 'SubjectUserSid'
+    $actor       = if ($subjectDom) { "$subjectDom\$subjectUser" } else { $subjectUser }
+
+    $memberName  = Get-XmlData $xml 'MemberName'
+    $memberSid   = Get-XmlData $xml 'MemberSid'
+    $memberAcct  = Resolve-Id ($memberName ?? $memberSid)
+    $memberUser  = if ($memberAcct) { ($memberAcct -split '\\')[-1] } else { $null }
+
+    # self-add condition: same account by name or SID
+    $selfByName  = ($memberUser -and $subjectUser -and ($memberUser -ieq $subjectUser))
+    $selfBySid   = ($memberSid  -and $subjectSid  -and ($memberSid  -ieq $subjectSid))
+    if (-not ($selfByName -or $selfBySid)) { continue }
+
+    $ts       = $e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
+    $procName = Get-XmlData $xml 'ProcessName'
+    $callerIp = Get-XmlData $xml 'IpAddress'  # present when applicable
+    $machine  = $e.MachineName
+
+    Write-Host "SELF-ADD ALERT: $actor added themself to '$targetGroup'"
+    Write-Host "Time:        $ts"
+    Write-Host "Computer/DC: $machine"
+    if ($procName) { Write-Host "Process:     $procName" }
+    if ($callerIp) { Write-Host "Source IP:   $callerIp" }
+    Write-Host ""
+    $hits++
+}
+
+if ($hits -eq 0) {
+    Write-Host "[Info] No admin self-promotion events in the last $LookbackMinutes minute(s)."
+}
+
+exit 0
